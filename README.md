@@ -51,10 +51,10 @@ https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
 ## Deployment
 Here are the steps to deploy the Solution using the provided CloudFormation template (billing-insights.yaml), along with a description of each parameter:
 
-- Clone the repository Clone this repository to your local machine using the following command: `git clone https://github.com/aws-samples/sample-aws-billing-insights/aws-billing-insights.git`
+- Clone the repository Clone this repository to your local machine using the following command: `git clone https://github.com/aws-samples/sample-aws-billing-insights.git`
 
 
-- Navigate to the repository directory `cd aws-billing-insights`
+- Navigate to the repository directory `cd sample-aws-billing-insights`
 
 - Create an AWS CloudFormation stack Open the AWS CloudFormation console and click on "Create stack" -> "With new resources (standard)"..
 
