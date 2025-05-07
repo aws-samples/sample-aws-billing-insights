@@ -1,0 +1,245 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a Lambda Function along with Event Scheduler"
+Parameters:
+  Region:
+    Type: String
+    Default: us
+    AllowedValues: 
+      - us
+      - apac
+      - eu
+    Description: Select the region category (us/apac/eu) required for selecting the model inference profile
+  snsTopicArn:
+    Description: SNS Topic Arn for notifications
+    Type: String
+  ScheduleExpr:
+    Type: String
+    Description: Enter the schedule for lambda, use rate expressions.
+      The default value triggers this every 30 days. For more information https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html#RateExpressions
+    Default: rate(30 days)
+###################################################################
+Resources:       
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - ce:GetCostAndUsage
+            Effect: Allow
+            Resource: 
+              Fn::Sub: arn:aws:ce:*:${AWS::AccountId}:*/GetCostAndUsage
+          - Action:
+            - bedrock:InvokeModel
+            Effect: Allow
+            Resource: 
+              - arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0
+              - Fn::Sub: arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*.amazon.nova-micro-v1:0
+          - Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: 
+              Fn::Sub: arn:aws:logs:${AWS::Region}:*:log-group:/aws/lambda/${AWS::StackName}-${AWS::AccountId}-${AWS::Region}:*
+          - Action:
+            - logs:CreateLogGroup
+            Effect: Allow
+            Resource:
+              Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Action:
+            - sns:Publish
+            Effect: Allow
+            Resource:
+              Ref: snsTopicArn
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Sub: AWS-USG-${AWS::StackName}-${AWS::Region}
+      RoleName:
+        Fn::Sub: AWS-USG-${AWS::StackName}-${AWS::Region}
+
+  EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - scheduler.amazonaws.com
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - lambda:InvokeFunction
+            Effect: Allow
+            Resource:
+            - Fn::GetAtt: LambdaFunction.Arn
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Sub: AWS-USG-Event-${AWS::StackName}-${AWS::Region}
+      RoleName:
+        Fn::Sub: AWS-USG-Event-${AWS::StackName}-${AWS::Region}
+
+###################################################################
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Generate billing insights
+      FunctionName: 
+        Fn::Sub: ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          Months: 3
+          TargetArn: 
+            Ref: snsTopicArn
+          regn: 
+            Ref: Region
+      Role: 
+        Fn::GetAtt: LambdaRole.Arn
+      ReservedConcurrentExecutions: 1
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from datetime import datetime
+          from dateutil.relativedelta import relativedelta
+
+          def lambda_handler(event, context):
+              try:
+                  # Initialize AWS clients
+                  ce_client = boto3.client('ce')
+                  bedrock = boto3.client('bedrock-runtime')
+                  client_sns = boto3.client('sns')
+                  
+                  
+                  #Get env vars
+                  TargetSNSArn = os.environ["TargetArn"]
+                  month_delta = int(os.environ["Months"])
+                  model_id= os.environ["regn"] + '.amazon.nova-micro-v1:0'
+                  
+                  # Getting the month ranges for last 3 months
+                  end_date = datetime.now().date().replace(day=1)
+                  start_date = (end_date + relativedelta(months=-month_delta)).replace(day=1).isoformat()
+                  end_date = end_date.isoformat()
+
+                  # Get cost and usage data
+                  response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date,
+                          'End': end_date
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['UnblendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'}
+                      ]
+                  )
+                  #print(response)
+                  #return
+                  # Process the cost data
+                  cost_data = []
+                  for result in response['ResultsByTime']:
+                      for group in result['Groups']:
+                          cost_data.append({
+                              'Period': result['TimePeriod']['Start'],
+                              'Service': group['Keys'][0],
+                              'Cost': float(group['Metrics']['UnblendedCost']['Amount']),
+                              'Usage': float(group['Metrics']['UsageQuantity']['Amount'])
+                          })
+
+                  # Prepare data for Bedrock analysis
+                  analysis_prompt = f"""
+                  Analyze the following AWS cost data for the last 3 months;Please provide a brief analysis of the cost trends and notable changes. {cost_data}
+                  """ 
+
+                  # Call Amazon Bedrock for analysis
+                  nova_request = {
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": [
+                              {
+                                  "text": analysis_prompt
+                              }
+                          ]
+                      }
+                  ]
+              }
+
+                  # Call Amazon Bedrock with Nova Micro model
+                  bedrock_response = bedrock.invoke_model(
+                      modelId=model_id,
+                      body=json.dumps(nova_request),
+                      accept="application/json"
+                  )
+
+                  # Parse the response
+                  response_body = json.loads(bedrock_response['body'].read().decode('utf-8'))
+                  if 'message' in response_body['output'] and len(response_body['output']['message']) > 0:
+                      analysis_result = response_body['output']['message']['content'][0]['text']
+                      print("\n #### SNS Notification ####\n")
+                      response_sns = client_sns.publish (
+                        TargetArn = TargetSNSArn,
+                        Subject=f'AWS Bill Insights for Account: {context.invoked_function_arn.split(':')[4]}, Region: {context.invoked_function_arn.split(':')[3]}',
+                        Message = analysis_result,
+                        MessageStructure = 'text'
+                      )
+                      print(response_sns)
+                  else:
+                      analysis_result = "No analysis available"
+                      print(analysis_result) 
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Runtime: python3.13
+      Timeout: 900
+      TracingConfig:
+        Mode: Active 
+
+###################################################################
+  ScheduledRule0:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Scheduled Rule for lambda execution
+      State: ENABLED
+      ScheduleExpression:
+        Ref: ScheduleExpr
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn:
+          Fn::GetAtt: LambdaFunction.Arn
+        RoleArn:
+          Fn::GetAtt: EventRole.Arn
+
+  PermissionForEventsToInvokeLambda0:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt: ScheduledRule0.Arn
